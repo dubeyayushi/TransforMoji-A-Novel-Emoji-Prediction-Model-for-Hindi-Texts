@@ -4,7 +4,7 @@
 TransforMoji is a novel transformer-based model designed specifically for emoji prediction in Hindi texts. The model achieves state-of-the-art performance with a cosine similarity score of 0.968, setting a new benchmark for semantic understanding in Hindi emoji prediction.
 Our custom-curated dataset, TransforMojiCorpus, contains 69,269 Hindi texts spanning 256 emoji classes, making it one of the largest Hindi-emoji datasets available. The dataset combines real-world data from social media platforms with synthetic data to ensure comprehensive coverage.
 
-📄 Read our complete research paper [here](URL).
+📄 Read our complete research paper [here](https://drive.google.com/file/d/1T1axALv9iwJaBD_K9Yahna1AOXPHYA9Z/view?usp=sharing).
 
 ## Repository Structure
 ```
