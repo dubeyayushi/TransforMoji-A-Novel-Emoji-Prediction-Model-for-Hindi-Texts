@@ -1,0 +1,329 @@
+
+
+import os
+import csv
+import random
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Tuple, Dict, List
+
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import accuracy_score
+
+
+# =========================================================
+# Config
+# =========================================================
+
+@dataclass
+class Config:
+    # Paths
+    csv_path: str = "final_lemmatized_dataset.csv"
+    smote_x_path: str = "smote/X_resampled_using_smote_lemmatized.npy"
+    smote_y_path: str = "smote/Y_resampled_using_smote_lemmatized.npy"
+    emoji2vec_path: str = "emoji2vec.txt"
+    metrics_dir: str = "metrics"
+    final_model_path: str = "transfomoji_model_final.pth"
+
+    # Training
+    num_epochs: int = 30
+    batch_size: int = 64
+    lr: float = 1e-3
+    weight_decay: float = 0.0
+    hidden_dim: int = 256
+    lstm_layers: int = 2
+    dropout: float = 0.3
+    seed: int = 42
+    val_split: float = 0.2
+
+    # Misc
+    use_amp: bool = False  # set True if you want mixed precision (needs CUDA)
+
+
+# =========================================================
+# Utils
+# =========================================================
+
+def seed_everything(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)  # no-op on CPU
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def ensure_dir(path: str | Path) -> None:
+    Path(path).mkdir(parents=True, exist_ok=True)
+
+
+# =========================================================
+# Data
+# =========================================================
+
+def load_data(cfg: Config, device: torch.device) -> Tuple[
+    DataLoader, DataLoader, LabelEncoder, int, int
+]:
+    """
+    Loads SMOTE-resampled features/labels, builds loaders, returns:
+    train_loader, val_loader, label_encoder, input_dim, num_classes
+    """
+    df = pd.read_csv(cfg.csv_path)
+    le = LabelEncoder().fit(df["emojis"])
+    num_classes = len(le.classes_)
+
+    X = np.load(cfg.smote_x_path)  # (N, feat_dim)
+    Y = np.load(cfg.smote_y_path)  # (N, )
+
+    X_t = torch.tensor(X, dtype=torch.float32).unsqueeze(1)  # (N, 1, feat_dim)
+    Y_t = torch.tensor(Y, dtype=torch.long)
+
+    N = len(Y_t)
+    val_n = int(cfg.val_split * N)
+    idx = torch.randperm(N)
+    val_idx = idx[:val_n]
+    train_idx = idx[val_n:]
+
+    train_ds = TensorDataset(X_t[train_idx], Y_t[train_idx])
+    val_ds = TensorDataset(X_t[val_idx], Y_t[val_idx])
+
+    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False)
+
+    _, _, input_dim = X_t.shape
+
+    return train_loader, val_loader, le, input_dim, num_classes
+
+
+def build_class_embeddings(le: LabelEncoder, cfg: Config, device: torch.device) -> torch.Tensor:
+    """
+    Builds a (num_classes, emb_dim) tensor using emoji2vec.txt for each label class.
+    """
+    emb_map: Dict[str, np.ndarray] = {}
+    with open(cfg.emoji2vec_path, "r", encoding="utf-8") as f:
+        for line in f:
+            parts = line.strip().split()
+            emb_map[parts[0]] = np.array(parts[1:], dtype=float)
+
+    cls_emb_list: List[torch.Tensor] = []
+    for e in le.classes_:
+        if e not in emb_map:
+            raise ValueError(f"Emoji '{e}' not found in {cfg.emoji2vec_path}")
+        cls_emb_list.append(torch.from_numpy(emb_map[e]))
+
+    cls_emb = torch.stack(cls_emb_list).to(device)  # (num_classes, emb_dim)
+    return cls_emb
+
+
+# =========================================================
+# Model
+# =========================================================
+
+class TransforMoji(nn.Module):
+    """
+    BiLSTM + single-head additive attention + 2-layer MLP classifier
+    """
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int,
+        output_dim: int,
+        lstm_layers: int = 2,
+        dropout: float = 0.5,
+    ):
+        super().__init__()
+        self.lstm = nn.LSTM(
+            input_dim,
+            hidden_dim,
+            num_layers=lstm_layers,
+            bidirectional=True,
+            batch_first=True,
+            dropout=dropout if lstm_layers > 1 else 0.0,
+        )
+        self.attn = nn.Linear(2 * hidden_dim, 1)
+        self.cls = nn.Sequential(
+            nn.Linear(2 * hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, output_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (batch, seq_len, feat_dim)
+        out, _ = self.lstm(x)                                   # (B, T, 2H)
+        w = torch.softmax(self.attn(out).squeeze(-1), dim=1)    # (B, T)
+        ctx = torch.sum(w.unsqueeze(-1) * out, dim=1)           # (B, 2H)
+        return self.cls(ctx)                                    # (B, C)
+
+
+# =========================================================
+# Train / Eval
+# =========================================================
+
+def train_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    criterion: nn.Module,
+    optimizer: optim.Optimizer,
+    device: torch.device,
+    use_amp: bool = False
+) -> float:
+    model.train()
+    total_loss = 0.0
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+
+    for xb, yb in tqdm(loader, desc="Train", leave=False):
+        xb, yb = xb.to(device), yb.to(device)
+
+        optimizer.zero_grad(set_to_none=True)
+
+        with torch.cuda.amp.autocast(enabled=use_amp):
+            preds = model(xb)
+            loss = criterion(preds, yb)
+
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+
+        total_loss += loss.item()
+
+    return total_loss / len(loader)
+
+
+@torch.no_grad()
+def eval_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    criterion: nn.Module,
+    device: torch.device,
+    cls_emb: torch.Tensor
+) -> Tuple[float, float, float]:
+    """
+    Returns: val_loss, accuracy, avg_cosine_similarity
+    """
+    model.eval()
+    total_loss = 0.0
+    all_preds, all_trues = [], []
+    cos_sims: List[float] = []
+
+    for xb, yb in tqdm(loader, desc="Val  ", leave=False):
+        xb, yb = xb.to(device), yb.to(device)
+
+        out = model(xb)
+        loss = criterion(out, yb)
+        total_loss += loss.item()
+
+        pred = out.argmax(dim=1)
+        all_preds.append(pred.cpu())
+        all_trues.append(yb.cpu())
+
+        # Cosine similarity between predicted & true emoji embeddings
+        p_emb = cls_emb[pred]  # (batch, emb_dim)
+        t_emb = cls_emb[yb]    # (batch, emb_dim)
+        cos = nn.functional.cosine_similarity(p_emb, t_emb, dim=1).mean().item()
+        cos_sims.append(cos)
+
+    y_pred = torch.cat(all_preds).numpy()
+    y_true = torch.cat(all_trues).numpy()
+
+    acc = accuracy_score(y_true, y_pred)
+    cos_mean = float(np.mean(cos_sims))
+
+    return total_loss / len(loader), acc, cos_mean
+
+
+def save_metrics_npy(cfg: Config, losses: List[float], accs: List[float], coss: List[float]) -> None:
+    np.save(Path(cfg.metrics_dir) / "TransforMoji_loss.npy", np.array(losses))
+    np.save(Path(cfg.metrics_dir) / "TransforMoji_acc.npy", np.array(accs))
+    np.save(Path(cfg.metrics_dir) / "TransforMoji_cos.npy", np.array(coss))
+
+
+def append_metrics_csv(cfg: Config, epoch: int, trn_loss: float, val_loss: float,
+                       val_acc: float, val_cos: float) -> None:
+    csv_path = Path(cfg.metrics_dir) / "TransforMoji_metrics.csv"
+    file_exists = csv_path.exists()
+    with open(csv_path, mode="a", newline="") as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow(["epoch", "train_loss", "val_loss", "val_acc", "val_cos"])
+        writer.writerow([epoch, trn_loss, val_loss, val_acc, val_cos])
+
+
+# =========================================================
+# Main
+# =========================================================
+
+def main(cfg: Config) -> None:
+    seed_everything(cfg.seed)
+    ensure_dir(cfg.metrics_dir)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Data
+    train_loader, val_loader, le, input_dim, num_classes = load_data(cfg, device)
+    print(f"Input dim: {input_dim} | #classes: {num_classes}")
+
+    # Class embeddings
+    cls_emb = build_class_embeddings(le, cfg, device)
+
+    # Model / Optim / Loss
+    model = TransforMoji(
+        input_dim=input_dim,
+        hidden_dim=cfg.hidden_dim,
+        output_dim=num_classes,
+        lstm_layers=cfg.lstm_layers,
+        dropout=cfg.dropout,
+    ).to(device)
+
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(
+        model.parameters(),
+        lr=cfg.lr,
+        weight_decay=cfg.weight_decay
+    )
+
+    # Train
+    val_losses, val_accs, val_coss = [], [], []
+
+    for epoch in range(1, cfg.num_epochs + 1):
+        print(f"\n===== Epoch {epoch:02d}/{cfg.num_epochs} =====")
+        trn_loss = train_epoch(
+            model, train_loader, criterion, optimizer, device, use_amp=cfg.use_amp
+        )
+        val_loss, val_acc, val_cos = eval_epoch(
+            model, val_loader, criterion, device, cls_emb
+        )
+
+        print(f"Train Loss: {trn_loss:.4f} | Val Loss: {val_loss:.4f} | "
+              f"Val Acc: {val_acc:.4f} | Val Cos: {val_cos:.4f}")
+
+        # Save checkpoint
+        torch.save(
+            model.state_dict(),
+            Path(cfg.metrics_dir) / f"transfomoji_epoch_{epoch:02d}.pth"
+        )
+
+        # Record & persist metrics
+        val_losses.append(val_loss)
+        val_accs.append(val_acc)
+        val_coss.append(val_cos)
+
+        save_metrics_npy(cfg, val_losses, val_accs, val_coss)
+        append_metrics_csv(cfg, epoch, trn_loss, val_loss, val_acc, val_cos)
+
+    # Save final model
+    torch.save(model.state_dict(), cfg.final_model_path)
+    print(f"\n✅ Training complete — final model saved to: {cfg.final_model_path}")
+    print(f"Metrics & checkpoints saved under: {cfg.metrics_dir}")
+
+
+if __name__ == "__main__":
+    main(Config())
