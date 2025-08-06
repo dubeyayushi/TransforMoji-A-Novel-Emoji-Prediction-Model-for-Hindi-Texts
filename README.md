@@ -48,7 +48,7 @@ Our custom-curated dataset, TransforMojiCorpus, contains 69,269 Hindi texts span
 - Generated text embeddings using MuRIL (Multilingual Representations for Indian Languages)
 
 ### 3. Data Balancing
-- Analyzed class distribution revealing significant imbalance
+- Analyzed class distribution, revealing significant imbalance
 - Applied two sampling techniques:
   - SMOTE (Synthetic Minority Over-sampling Technique)
   - Random Undersampling
